@@ -13,6 +13,14 @@ from natsort import natsorted
 
 logging.getLogger('matplotlib.font_manager').disabled = True
 
+def setup_svg_font_defaults() -> None:
+    """
+    Keep SVG text editable and request Helvetica as default.
+    """
+    plt.rcParams["svg.fonttype"] = "none"
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = ["Helvetica", "Arial", "DejaVu Sans"]
+
 def make_counts_plots(df, 
                       outdir=None, 
                       groupby='label', 
@@ -133,12 +141,18 @@ def make_freqplot_combined_sns(df,
 def make_freqplot_single_sns(df, 
                            title='Frequency',  
                            outfile='frequency-plot.pdf',
+                           svg_outfile=None,
                            column='read_count',
                            scale=None,
-                           proportion=0.85 ):    
+                           proportion=0.85,
+                           nranks=None,
+                           x_mode='linear_rank',
+                           y_cutoff=None,
+                           ):    
     '''
     single figure with one plot. 
     scale = log10 | log2 | None  
+    x_mode = linear_rank | log10_rank | log10_frac
     '''
     from matplotlib.backends.backend_pdf import PdfPages as pdfpages
     datestr = dt.datetime.now().strftime("%Y%m%d%H%M")
@@ -147,11 +161,27 @@ def make_freqplot_single_sns(df,
         title = f'{title} ({scale})'
     
     page_dims = (8, 6)
+    fig = None
     with pdfpages(outfile) as pdfpages:
         fig, axes = plt.subplots(figsize=page_dims)
         fig.suptitle(title)
-        counts_axis_plot_sns(axes, df, column=column, title=f'{column} freqplot', scale=scale, proportion=proportion)
+        counts_axis_plot_sns(
+            axes,
+            df,
+            column=column,
+            title=f'{column} freqplot',
+            scale=scale,
+            proportion=proportion,
+            nranks=nranks,
+            x_mode=x_mode,
+            y_cutoff=y_cutoff,
+        )
         pdfpages.savefig(fig)
+        if svg_outfile is not None:
+            setup_svg_font_defaults()
+            fig.savefig(svg_outfile, format="svg")
+    if fig is not None:
+        plt.close(fig)
     logging.info(f'saved plot PDF to {outfile}')
 
 def counts_axis_plot_sns(ax, 
@@ -160,7 +190,10 @@ def counts_axis_plot_sns(ax,
                          column='read_count', 
                          title='counts frequency', 
                          nranks=None,
-                         proportion=0.85 ) :
+                         proportion=0.85,
+                         x_mode='linear_rank',
+                         y_cutoff=None,
+                         ) :
     '''
     Creates individual axes for single plot within figure. 
     scale = None | log10  | log2
@@ -186,48 +219,74 @@ def counts_axis_plot_sns(ax,
     
 
     '''
-    logging.debug(f'column={column} scale={scale} title={title}')
-    pdf = df.sort_values(by=[column], ascending=False)
-    # calculate before x-axis thresholding for visual clarity
-    h = calc_freq_threshold(pdf, fraction=proportion, column = column)
-    nranks_initial = len(pdf)
+    logging.debug(f'column={column} scale={scale} title={title} x_mode={x_mode}')
+    pdf_full = df.sort_values(by=[column], ascending=False)
+    h = calc_freq_threshold(pdf_full, fraction=proportion, column=column)
+    nranks_initial = len(pdf_full)
+    n = nranks_initial
+    t = int(pdf_full[column].max())
+    s_all = int(pdf_full[column].sum())
+
+    pdf = pdf_full
     if nranks is not None:
+        nranks = int(nranks)
         logging.debug(f'limiting x-axis to {nranks} ranks.')
-        pdf = pdf.iloc[:nranks]    
+        pdf = pdf.iloc[:nranks]
+    pdf = pdf.copy()
     pdf.reset_index(inplace=True, drop=True)
     pdf.reset_index(inplace=True)
-    
-    s = pdf[column].sum()
-    n = len(df)
-    t = pdf[column].max()
-    r = pdf['index'].max()
+
+    rank_1 = pdf['index'].to_numpy(dtype=float) + 1.0
+    n_full = float(nranks_initial) if nranks_initial else 1.0
+
+    if x_mode == 'linear_rank':
+        x = pdf['index'].to_numpy(dtype=float)
+        x_label = 'Rank'
+        ax.set_xscale('linear')
+    elif x_mode == 'log10_rank':
+        x = rank_1
+        x_label = 'Rank (log scale)'
+        ax.set_xscale('log')
+    elif x_mode == 'log10_frac':
+        x = np.maximum(rank_1 / n_full, 1.0 / n_full)
+        x_label = 'rank / N (log scale)'
+        ax.set_xscale('log')
+    else:
+        raise ValueError(f'counts_axis_plot_sns: unknown x_mode={x_mode!r}')
 
     logging.debug(f'making lineplot...')
-    sns.lineplot(ax=ax, data=pdf, x=pdf['index'], y=pdf[column])
+    sns.lineplot(ax=ax, x=x, y=pdf[column].to_numpy())
     logging.debug(f'done. calc bounds...')
 
-    lx = pdf['index'].max()
-    ly = pdf[column].max()
+    lx = float(x.max())
+    ly = float(pdf[column].max())
 
-    ax.set_xlabel('Rank')
+    ax.set_xlabel(x_label)
 
     if scale == 'log10':
         ax.set_yscale('log')
-        #major_ticks = [1, 10, 100, 1000, 10000, 100000, 1000000]
         major_ticks = make_logticks(ly)
         ax.set_yticks(major_ticks)
         ax.set_ylabel(f'log10( {column} )')
         title = f'{title} log10()'
-        #ly = math.log10(ly)       
         logging.debug(f'made axis with log scale y-axis.')
     else:
         ax.set_ylabel(f'{column}')
         logging.debug(f'made axis with no scaling.')
 
-    ax.set_xlim(left=0,right=None) 
-    ax.set_ylim(bottom=0, top=None) 
+    if x_mode == 'linear_rank':
+        ax.set_xlim(left=0, right=None)
+    elif x_mode == 'log10_rank':
+        ax.set_xlim(left=max(0.8, float(x.min()) * 0.9), right=None)
+    else:
+        ax.set_xlim(left=float(x.min()) * 0.95, right=min(1.0, float(x.max()) * 1.05))
 
-    ax.text(lx, ly, s=f"n={n}\ntop={t}\nsum={s}\nest_{proportion}_threshold={h}",
+    ax.set_ylim(bottom=0, top=None)
+
+    if y_cutoff is not None:
+        ax.axhline(float(y_cutoff), color='red', linestyle='--', linewidth=1.0)
+
+    ax.text(lx, ly, s=f"n={n}\ntop={t}\nsum={s_all}\nest_{proportion}_threshold={h}",
             fontsize=11, 
             horizontalalignment='right',
             verticalalignment='top'            
@@ -262,6 +321,114 @@ def calc_freq_threshold(df, fraction=0.9, column = 'read_count'):
     idx = int(len(ser) * fraction)
     t = int( ser.iloc[idx] + 1 )    
     return t
+
+
+def estimate_optimum_nranks(
+    df,
+    column='read_count',
+    tail_read_mass=0.001,
+    pad_fraction=0.01,
+    pad_min=500,
+):
+    """
+    Rows are sorted by read_count descending (same as the frequency plot).
+    Choose nranks that keeps (1 - tail_read_mass) of total read mass and adds a pad.
+    """
+    n = len(df)
+    if n == 0:
+        return 0
+    ser = df[column].sort_values(ascending=False).reset_index(drop=True)
+    total = int(ser.sum())
+    if total == 0:
+        return n
+    cum = ser.cumsum()
+    target = total * (1.0 - tail_read_mass)
+    idx = int((cum >= target).idxmax())
+    n_keep = idx + 1
+    pad = max(int(pad_min), int(pad_fraction * n))
+    return min(n, n_keep + pad)
+
+
+def write_readtable_frequency_plots_bundle(
+    df,
+    outdir,
+    project_id,
+    column='read_count',
+    scale='log10',
+    proportion=0.85,
+    y_cutoff=None,
+    cutoff_suffix=None,
+):
+    """
+    Standard readtable overall frequency plot PDF+SVG plus optimum-scale and two uniform x-scale variants.
+    """
+    base = os.path.join(outdir, f'{project_id}.readtable-frequency-plot')
+    make_freqplot_single_sns(
+        df,
+        title='Overall read count frequency',
+        outfile=f'{base}.pdf',
+        svg_outfile=f'{base}.svg',
+        column=column,
+        scale=scale,
+        proportion=proportion,
+        nranks=None,
+        x_mode='linear_rank',
+    )
+    opt_n = estimate_optimum_nranks(df, column=column)
+    logging.info(
+        'readtable frequency optimum nranks=%s of %s rows (column=%s)',
+        opt_n,
+        len(df),
+        column,
+    )
+    make_freqplot_single_sns(
+        df,
+        title='Overall read count frequency (optimum-scale)',
+        outfile=f'{base}_optimum-scale.pdf',
+        svg_outfile=f'{base}_optimum-scale.svg',
+        column=column,
+        scale=scale,
+        proportion=proportion,
+        nranks=opt_n,
+        x_mode='linear_rank',
+    )
+    make_freqplot_single_sns(
+        df,
+        title='Overall read count frequency (uniform log rank)',
+        outfile=f'{base}_uniform-scale_logrank.pdf',
+        svg_outfile=f'{base}_uniform-scale_logrank.svg',
+        column=column,
+        scale=scale,
+        proportion=proportion,
+        nranks=None,
+        x_mode='log10_rank',
+        y_cutoff=y_cutoff,
+    )
+    make_freqplot_single_sns(
+        df,
+        title='Overall read count frequency (uniform log fraction)',
+        outfile=f'{base}_uniform-scale_logfraction.pdf',
+        svg_outfile=f'{base}_uniform-scale_logfraction.svg',
+        column=column,
+        scale=scale,
+        proportion=proportion,
+        nranks=None,
+        x_mode='log10_frac',
+    )
+
+    if y_cutoff is not None and cutoff_suffix is not None:
+        make_freqplot_single_sns(
+            df,
+            title=f'Overall read count frequency (uniform log rank; cutoff={y_cutoff})',
+            outfile=f'{base}_uniform-scale_logrank_{cutoff_suffix}.pdf',
+            svg_outfile=f'{base}_uniform-scale_logrank_{cutoff_suffix}.svg',
+            column=column,
+            scale=scale,
+            proportion=proportion,
+            nranks=None,
+            x_mode='log10_rank',
+            y_cutoff=y_cutoff,
+        )
 
 
 def counts_freq(matlabfile, logscale = 'log10', logcol = 'counts' ):

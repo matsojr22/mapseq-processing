@@ -10,7 +10,7 @@ project_id=M001
 project_leader=Anthony Zador
 project_institution=CSHL
 
-[ssi]
+[barcodes]
 #ssifile = ~/git/mapseq-processing/etc/barcode_v2.txt
 #ssifile = ~/git/mapseq-processing/etc/ssi_v2.txt
 ssifile = ~/git/mapseq-processing/etc/novaseq_all.txt
@@ -42,11 +42,6 @@ seqhandled_interval = 1000000
 # Pandas number of lines to read from TSV at a time.
 # Typically 1.5GB + 1.5GB (R1 + R2) for MAPseq FASTQs  
 chunksize=50000000
-# On ~24GB RAM machines, try 10000000 with fastq_low_memory=True.
-
-# Stream reads TSV chunk-by-chunk (constant RAM). Cannot use with write_each,
-# filter_by_non_dominant, or filter_by_sampleinfo_ssi.
-fastq_low_memory = False
 
 # fast storage large enough for all data, e.g. ~500GB+
 use_dask = False
@@ -64,6 +59,7 @@ min_reads = 1
 # NEXTSEQ
 # Basic pattern  M2825_R2_001.fastq.gz
 # source_regex=(.+?)_
+
 
 #  NOVASEQ
 # FASTQs with sample and lane 
@@ -106,6 +102,7 @@ ourtube_regex=.+?-(.+?)_
 # Alternate pattern  m309_a50_S134_L002_R1_001
 # ourtube_regex=.{4}_(.*?)_S.+?_L.+?_
 
+
 # filter by extra dominant?
 filter_by_non_dominant = False
 filter_column = ssi
@@ -139,6 +136,7 @@ ssi_end = 52
 #rrtag_st = 56
 #rrtag_end = 60
 
+
 # include novaseq 5nt field GTACT, 5nt R2 CACGA
 #rtag_st=32
 #rtag_end=37
@@ -150,8 +148,8 @@ ssi_end = 52
 #rrtag_end = 62
 
 [readfilter]
-# optionally filter read fields that don't match  
-# required sequence. 
+# filter read fields that don't match requirement
+#
 # novaseq 5nt
 #rtag_seq = GTACT
 #rrtag_seq = CACGA
@@ -161,30 +159,35 @@ ssi_end = 52
 
 # nextseq 4nt rrtag
 # rrtag_seq = TGTA
+
 drop_mismatch = False
 
 
+
+
+
 [readtable]
+# Readtable creation is where sample metadata is mapped/added:
+#
 # Sampleinfo.xlsx/tsv site-type definitions:
 #
 # LABEL						SOURCE				MEANING
 # EXPERIMENTAL
 # target					user-provided		treated sample
 # target-negative           user-provided    	treated but expected to be low
-# 	  (Both handled exactly the same and included in matrices) 
+# 	  Both handled exactly the same and included in matrices. 
 # injection					user-provided 		treated sample
 # CONTROLS
 # target-negative-control   user-provided   	untreated sample
 # target-wt-control         core added      	untreated biological sample
 # target-water-control      core added      	empty sample
 # injection-water-control   core added      	empty sample
- 
-# VBC type identification
-# last 2nt of spike-ins AND reals
+
+# 
 # T or C = YY
-# last 2nt of L1 controls (if included). 
+# last 2nt of spike-ins AND reals
 # A or G = RR
- 
+# last 2nt of L1 controls 
 spikeseq= CGTCAGTC
 realregex = [TC][TC]$
 
@@ -195,13 +198,11 @@ use_lone = False
 loneregex = [AG][AG]$
 filter_by_libtag = True
 
-# Filter L1 from output.
-include_lone = False
-
 [collapse]
 tool = bowtie2
 #tool = bowtie
 library = networkx
+
 # locally-coded Tarjan
 # library = custom
 n_bases = 30
@@ -210,8 +211,8 @@ n_bases = 30
 max_mismatch = 3
 # Edit distance (includes indels). 
 max_distance = 3
-seq_length = 30
 
+seq_length = 30
 # Should track overall data size (unique VBC sequences). 
 # 5000 for desktop/laptop, 40000+ for novaseq?
 # max_recursion = 5000
@@ -219,6 +220,7 @@ max_recursion = 40000
 
 # Read count thresholding option just *before* collapse 
 min_reads = 1
+
 
 [bowtie]
 threads = 10
@@ -230,24 +232,18 @@ max_mismatch = 3
 max_mismatch = 3
 threads = 10
 
+
+
 [vbctable]
 inj_min_reads = 1
 target_min_reads = 1
 
-# Filter L1 from output.
-include_lone = False
-
-# UMI threshold parameter sweep
 # string evaluated, by eval(), to a list of integer tuples.
 # (inj_min_umis, target_min_umis) 
 # if populated, will create XLSX report of n_unique VBCs
 # at the various thresholds.
 # test_params = [ ]
 test_params = [ (5,3) ,(10,3), (10,5), (20,5), (30,5),(30,10)]
-
-# For use with virus libraries
-# Merge all rows into one virtual SSI target. 
-merge_samples = False
 
 
 [vbcfilter]
@@ -262,9 +258,6 @@ include_injection=True
 # Include non-brain-specific controls in filtered table, so they will
 # be included in matrices. 
 include_controls = True
-
-# Filter L1 from final output.
-include_lone = False
 
 # Per-brain, threshold UMI count in target areas to only those 
 # more than the largest target-negative total in that brain.  
@@ -288,21 +281,4 @@ clustermap_scale=log2
 
 # Include non-brain-specific controls in in every brain matrix. 
 include_controls = True
-
-
-[plots]
-heatmap_cmap = Blues
-
-
-[qpcr]
-cycle_low_offset = 1
-cycle_high_offset = 0
-kneed_sensitivity = 1.0
-kneed_polynomial = 2
-group_span = 3
-
-[viruslib]
-uniq_min_umi = 2
-n_terms = 25
-start = 10000
 

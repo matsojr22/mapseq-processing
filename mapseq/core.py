@@ -221,6 +221,28 @@ def write_mapseq_df(df, outfile, outformats=['tsv','parquet'] ):
     logging.info(f'Done writing DF to desired format(s).')
 
     
+def _fix_mapseq_df_types_dask(df, fformat='reads', use_arrow=True):
+    """
+    Dask DataFrame variant: no fillna(inplace=...), no pandas categorical tricks.
+    """
+    logging.info(f'dask fix_mapseq_df_types fformat={fformat} old dtypes=\n{df.dtypes}')
+    if fformat not in FFORMATS:
+        logging.warning('unrecognized mapseq format. return original')
+        return df
+    tt = 'string[pyarrow]' if use_arrow else 'string[python]'
+    for scol in STR_COLS[fformat]:
+        if scol in df.columns:
+            df[scol] = df[scol].astype(tt)
+    for icol in INT_COLS[fformat]:
+        if icol in df.columns:
+            df[icol] = df[icol].fillna(0).astype('int64')
+    for ccol in CAT_COLS[fformat]:
+        if ccol in df.columns:
+            df[ccol] = df[ccol].astype(tt).fillna('')
+    logging.info(f'dask new dtypes=\n{df.dtypes}')
+    return df
+
+
 def fix_mapseq_df_types(df, 
                         fformat='reads', 
                         use_arrow=True):
@@ -231,6 +253,9 @@ def fix_mapseq_df_types(df,
     Fix NaNs. 
     
     '''
+    if isinstance(df, dd.DataFrame):
+        return _fix_mapseq_df_types_dask(df, fformat=fformat, use_arrow=use_arrow)
+
     logging.info(f'old dataframe dtypes=\n{df.dtypes}')
     
     if fformat in FFORMATS:
@@ -269,8 +294,8 @@ def fix_mapseq_df_types(df,
                         df[ccol] = df[ccol].cat.add_categories([''])
                     except ValueError:
                         logging.debug(f"category ''  already exists." )
-                #df[ccol].fillna('', inplace=True)                        
-                df.fillna( {ccol: ''}, inplace=True)
+                #df[ccol].fillna('', inplace=True)
+                df = df.fillna({ccol: ''})
             except KeyError:
                 logging.warning(f'column {ccol} not found. Vital for {fformat}?')        
             
@@ -579,11 +604,108 @@ def process_fastq_pairs_pd_chunked( infilelist,
     return df          
 
 
+def _process_fastq_grouped_low_memory(
+    infilelist,
+    outdir,
+    sampdf,
+    reads_outfile,
+    cp,
+    sh,
+):
+    """
+    Same FASTQ parsing as process_fastq_grouped, but each chunk is split and appended
+    to reads_outfile instead of concat into one DataFrame (avoids OOM on limited RAM).
+
+    Incompatible with write_each, filter_by_non_dominant, filter_by_sampleinfo_ssi.
+    """
+    r1s = int(cp.get('fastq', 'r1start'))
+    r1e = int(cp.get('fastq', 'r1end'))
+    r2s = int(cp.get('fastq', 'r2start'))
+    r2e = int(cp.get('fastq', 'r2end'))
+    chunksize = int(cp.get('fastq', 'chunksize', fallback=50000))
+    source_regex = cp.get('fastq', 'source_regex', fallback='(.+?_S.+?_L.+?)_')
+
+    rdir = os.path.dirname(os.path.abspath(reads_outfile))
+    if rdir:
+        os.makedirs(rdir, exist_ok=True)
+
+    row_offset = 0
+    pairnum = 1
+    total_rows = 0
+    first_write = True
+
+    for (read1file, read2file) in infilelist:
+        source_label = parse_sourcefile(read1file, source_regex, 1)
+        logging.info(
+            'fastq_low_memory: %s %s source_label=%s',
+            read1file,
+            read2file,
+            source_label,
+        )
+        start = dt.datetime.now()
+        pair_rows = 0
+        fh1 = get_fh(read1file)
+        dfi1 = pd.read_csv(
+            fh1,
+            header=None,
+            skiprows=lambda x: x % 4 != 1,
+            dtype="string[pyarrow]",
+            chunksize=chunksize,
+        )
+        fh2 = get_fh(read2file)
+        dfi2 = pd.read_csv(
+            fh2,
+            header=None,
+            skiprows=lambda x: x % 4 != 1,
+            dtype="string[pyarrow]",
+            chunksize=chunksize,
+        )
+        for chunk1 in dfi1:
+            chunk2 = dfi2.get_chunk()
+            ndf = pd.DataFrame(columns=['sequence'], dtype='string[pyarrow]')
+            ndf['sequence'] = chunk1[0].str.slice(r1s, r1e) + chunk2[0].str.slice(
+                r2s, r2e
+            )
+            ndf['source'] = source_label
+            add_split_fields(ndf, 'sequence', cp, 'fastq')
+            ndf.index = pd.RangeIndex(row_offset, row_offset + len(ndf))
+            row_offset += len(ndf)
+            ndf.to_csv(
+                reads_outfile,
+                mode='w' if first_write else 'a',
+                sep='\t',
+                header=first_write,
+                index=True,
+            )
+            first_write = False
+            n = len(ndf)
+            pair_rows += n
+            total_rows += n
+            del ndf
+            del chunk1
+            del chunk2
+            gc.collect()
+
+        delta_seconds = (dt.datetime.now() - start).seconds
+        log_transferinfo([read1file, read2file], delta_seconds)
+        sh.add_value('/fastq', f'pair{pairnum}_len', pair_rows)
+        pairnum += 1
+
+    sh.add_value('/fastq', 'reads_handled', total_rows)
+    sh.add_value('/fastq', 'pairs_handled', pairnum)
+    logging.info(
+        'fastq_low_memory: finished streaming %d rows to %s',
+        total_rows,
+        reads_outfile,
+    )
+
+
 def process_fastq_grouped(   infilelist, 
                              outdir,
                              sampdf=None,                         
                              force=False, 
                              cp = None,
+                             reads_outfile=None,
                              ):
     '''
     parse infiles by pairs. 
@@ -611,6 +733,23 @@ def process_fastq_grouped(   infilelist,
     if sampdf is None:
         filter_by_sampleinfo_ssi = False
         logging.warning('No sampleinfo provided. Filename-based SSI filtering not possible.')
+
+    low_mem = cp.getboolean('fastq', 'fastq_low_memory', fallback=False)
+    if low_mem:
+        if write_each or filter_by_non_dominant or filter_by_sampleinfo_ssi:
+            logging.error(
+                'fastq_low_memory requires write_each=False, '
+                'filter_by_non_dominant=False, filter_by_sampleinfo_ssi=False'
+            )
+            sys.exit(1)
+        if reads_outfile is None:
+            logging.error('fastq_low_memory requires reads_outfile (internal error)')
+            sys.exit(1)
+        sh = get_default_stats()
+        _process_fastq_grouped_low_memory(
+            infilelist, outdir, sampdf, reads_outfile, cp, sh
+        )
+        return None
     logging.info(f' write_each = {write_each} filter_by_non_dominant={filter_by_non_dominant} filter_column={filter_column} drop_filter_column={drop_filter_column} filter_by_sampleinfo_ssi={filter_by_sampleinfo_ssi} chunksize={chunksize} lines.')
     logging.debug(f'read1[{r1s}:{r1e}] + read2[{r2s}:{r2e}]')
     
@@ -871,12 +1010,6 @@ def aggregate_reads(df,
     
     if outdir is None:
         outdir = os.path.abspath('./')
-
-    by_source = cp.getboolean('fastq','aggregate_by_source', fallback=True)
-    by_column = None
-    if by_source:
-        by_column = 'source'
-    
     logging.info(f'aggregate_reads: use_dask={use_dask} dask_temp={dask_temp} min_reads={min_reads}')
     
     if use_dask:
@@ -890,8 +1023,7 @@ def aggregate_reads(df,
         df = aggregate_reads_pd(df, 
                                 column, 
                                 outdir=outdir, 
-                                min_reads=min_reads,
-                                by_column = by_column )
+                                min_reads=min_reads )
     return df
     
     
@@ -899,57 +1031,30 @@ def aggregate_reads(df,
 def aggregate_reads_pd(df, 
                        column=['sequence','source'], 
                        outdir=None, 
-                       min_reads=1,
-                       by_column = 'source'):
+                       min_reads=1):
     initlen = len(df)
     logging.debug(f'aggregating read counts DF len={len(df)} column={column}')
-    
-    outdf = None
-
-    if by_column is not None:
-        by_vals = list( df[by_column].unique() )
-        n_groups_total = len(by_vals)
-        n_groups_done = 0
-        for bval in by_vals:
-            logging.debug(f'aggregating {by_column}={bval}...')
-            sdf = df[ df[by_column] == bval ]
-            vcs = sdf.value_counts( column )
-            ndf = pd.DataFrame( vcs )
-            ndf.reset_index(inplace=True, drop=False)
-            logging.debug(f'ndf=\n{ndf}')
-            if outdf is None:
-                logging.debug(f'outdf is none, outdf = \n{ndf}')
-                outdf = ndf
-            else:
-                outdf = pd.concat([outdf, ndf], ignore_index=True)
-                logging.debug(f'outdf exists, outdf after another concat = \n{outdf}')
-                ndf = None
-                collected_count = gc.collect()
-                logging.debug(f"Garbage collector: collected {collected_count} objects.")
-            n_groups_done += 1
-            logging.info(f'[{n_groups_done}/{n_groups_total}]')
-            log_objectinfo(outdf, 'aggregation outdf:')
-
-    else:
+    try:
+        # some test files may only have 'sequence' column.
         vcs = df.value_counts( column )
-        ndf = pd.DataFrame( vcs )
-    logging.debug(f'final outdf = \n{outdf}')
-    logging.debug(f'finished aggregating. reindex and adjust count column name... ')
-    outdf.rename({'count':'read_count'}, inplace=True, axis=1)
-    outdf.reset_index(inplace=True, drop=False)
-    logging.debug(f'DF len={len(outdf)}')
+    except KeyError:
+        vcs = df.value_counts( column[0])
+    ndf = pd.DataFrame( vcs )
+    ndf.reset_index(inplace=True, drop=False)
+    ndf.rename({'count':'read_count'}, inplace=True, axis=1)
+    logging.debug(f'DF len={len(ndf)}')
     
     if min_reads > 1:
         logging.info(f'Dropping reads with less than {min_reads} read_count.')
-        logging.debug(f'Length before read_count threshold={len(outdf)}')
-        outdf = outdf[outdf['read_count'] >= min_reads]
-        outdf.reset_index(inplace=True, drop=True)
-        logging.info(f'Length after read_count threshold={len(outdf)}')    
+        logging.debug(f'Length before read_count threshold={len(ndf)}')
+        ndf = ndf[ndf['read_count'] >= min_reads]
+        ndf.reset_index(inplace=True, drop=True)
+        logging.info(f'Length after read_count threshold={len(ndf)}')    
     else:
         logging.info(f'min_reads = {min_reads} skipping initial read count thresholding.')  
-    logging.info(f'final output DF len={len(outdf)}')
-
-    return outdf
+    logging.info(f'final output DF len={len(ndf)}')
+    
+    return ndf
 
 def aggregate_reads_dd(seqdf, 
                        column=['sequence','source'], 

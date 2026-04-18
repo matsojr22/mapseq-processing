@@ -232,6 +232,71 @@ After the readtable has been created, so we know what values go with what labels
 
 Kebschull, Justus M., and Anthony M. Zador. “Sources of PCR-Induced Distortions in High-Throughput Sequencing Data Sets.” Nucleic Acids Research 43, no. 21 (December 2, 2015): e143. https://doi.org/10.1093/nar/gkv717.
 
+### run_mapseq_one_pair.sh (plain bash — no Python batching)
+
+If you prefer explicit shell commands: **[scripts/run_mapseq_one_pair.sh](scripts/run_mapseq_one_pair.sh)** runs all eight pipeline steps for **one** R1/R2 pair (`-v`, `-c`, `-o`/`-O`, `-L` logs, `-s` sampleinfo where needed). `project_id` is taken from your config file.
+
+**Limited RAM (e.g. 24GB):** In **`[fastq]`** set **`fastq_low_memory = True`** and a smaller **`chunksize`** (e.g. `10000000`). Reads are then **streamed** to the output TSV one chunk at a time instead of concatting the whole run in memory. This requires **`filter_by_non_dominant = False`**, **`filter_by_sampleinfo_ssi = False`**, and **`write_each = False`** (defaults in `etc/mapseq.conf`). In this mode you only get the **TSV** reads file from the fastq step (no automatic `.reads.parquet` sidecar); downstream steps still work. Also use **`MAPSEQ_USE_DASK_AGGREGATE=1`** (and a temp dir) so **`aggregate_reads`** uses Dask on that large TSV.
+
+**Memory and Dask (default path):** Without `fastq_low_memory`, `process_fastq_pairs.py` holds the full reads table in RAM. **`aggregate_reads.py`** can use Dask (`-k`) so the `*.reads.tsv` is read lazily with spill to disk: pass a 6th argument temp directory **or** set **`MAPSEQ_USE_DASK_AGGREGATE=1`** (uses 6th arg, or env **`DASK_TEMP`**, or **`~/scratch`**). Example:
+
+```bash
+export MAPSEQ_USE_DASK_AGGREGATE=1
+export DASK_TEMP="$HOME/scratch"
+./scripts/run_mapseq_one_pair.sh CONFIG SAMPLEINFO OUTDIR R1.gz R2.gz
+```
+
+The Python batch helper’s **`--dask-temp`** also passes **`-k -t`** to `aggregate_reads` only.
+
+```bash
+conda activate mapseq_processing
+cd ~/git/mapseq-processing
+
+./scripts/run_mapseq_one_pair.sh \
+  MY_DATA/M265.mapseq.conf \
+  MY_DATA/M265_sampleinfo.xlsx \
+  MY_DATA/M265/M265_1/mapseq_pipeline/run1 \
+  MY_DATA/M265/M265_1/M265_1_S1_R1_001.fastq.gz \
+  MY_DATA/M265/M265_1/M265_1_S1_R2_001.fastq.gz \
+  ~/scratch
+```
+
+(Optional 6th arg is Dask temp for `aggregate_reads`; omit if not needed.) Duplicate the invocation for each library/pair with a different `OUTDIR` and FASTQs. Example with two calls for M265: **[scripts/examples/run_M265_pairs.sh](scripts/examples/run_M265_pairs.sh)**.
+
+### collect_read_count_pdfs.py (batch pipeline + read_count PDFs)
+
+**Activate the Conda environment first** (e.g. `conda activate mapseq_processing`). The stage scripts need the same dependencies as the rest of this repo (`natsort`, `dask`, etc.); the macOS system Python will not work. Non-interactive option: `conda run -n mapseq_processing python scripts/collect_read_count_pdfs.py ...`.
+
+Use this helper to scan a tree of experiment folders (e.g. `MY_DATA/M265/`, `MY_DATA/M312/hzhan_207118/`), then for **each R1/R2 pair** run the MAPseq stage scripts **explicitly** in order (the same steps as in the main pipeline docs: `process_fastq_pairs` → `aggregate_reads` → `filter_split` → `make_readtable` → `align_collapse` → `make_vbctable` → `filter_vbctable` → `make_matrices`). It does **not** call `process_all.py`. Each subprocess is invoked like a manual run: **`-v`** (verbose), **`-c`** config, **`-o`** / **`-O`** outputs, **`-L`** per-step log under the pair directory; **`process_fastq_pairs`** also gets **`-s`** sampleinfo and the two FASTQ paths (same idea as `process_fastq_pairs.py -v -c EXP.mapseq.conf -o reads.out/EXP.reads.tsv … R1 R2`).
+
+Each pair writes under **`<version_dir>/<pipeline_subdir>/<pair_slug>/`** (default `mapseq_pipeline/<pair_slug>/`) so multiple FASTQ pairs in one folder do not overwrite each other. `*read_count*.pdf` files from `make_readtable` are copied to **`MY_DATA/pdfs/<experiment>/<version>/<pair_slug>/`**. A TSV manifest is appended at `MY_DATA/pdfs/pdf_manifest.tsv` (includes a **`pair`** column).
+
+**Default is dry-run** (prints every subprocess command and what would be copied). Pass **`--execute`** to run the pipeline.
+
+```
+conda activate mapseq_processing   # required: use your MAPseq conda env
+
+# Preview only (no processing)
+python scripts/collect_read_count_pdfs.py --my-data-root MY_DATA
+
+# Full pipeline through matrices, then copy PDFs
+python scripts/collect_read_count_pdfs.py --my-data-root MY_DATA --execute
+
+# Stop after readtable (e.g. read_count plots only; faster)
+python scripts/collect_read_count_pdfs.py --my-data-root MY_DATA --halt readtable --execute
+
+# Dask temp dir for aggregate_reads (-t)
+python scripts/collect_read_count_pdfs.py --my-data-root MY_DATA --dask-temp ~/scratch --execute
+
+# Limit to specific experiment folders (e.g. only M265)
+python scripts/collect_read_count_pdfs.py --my-data-root MY_DATA --only-experiments M265 --execute
+```
+
+- **Sample information**: each version directory (or its parent experiment folder) should contain a `*sampleinfo*.xlsx` file. You can also put **`MY_DATA/<Experiment>_sampleinfo.xlsx`** next to the experiment folder (e.g. `MY_DATA/M265_sampleinfo.xlsx` with data under `MY_DATA/M265/`). Otherwise that version is skipped for pipeline execution (existing PDFs under per-pair output dirs can still be copied).
+- **FASTQ pairs**: only complete R1/R2 pairs are processed; incomplete downloads are skipped.
+- **Config**: place `<Experiment>.mapseq.conf` or any `*.mapseq.conf` next to the FASTQs, or **`MY_DATA/<Experiment>.mapseq.conf`** next to the experiment folder, so `[project] project_id` matches the experiment (otherwise outputs use the ID from the default `etc/mapseq.conf`).
+- **Pipeline output** per pair: `<version_dir>/<pipeline_out_subdir>/<pair_slug>/` (override base name with `--pipeline-out-subdir`).
+
 ##  Next Steps
 
 Code useful for further investigation,  inference, and visualization is contained in the mapseq-analysis project:   

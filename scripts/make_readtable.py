@@ -17,6 +17,7 @@ from mapseq.core import *
 from mapseq.barcode import *
 from mapseq.utils import *
 from mapseq.stats import *
+from mapseq.plotting import write_readtable_frequency_plots_bundle
 
 
 if __name__ == '__main__':
@@ -215,13 +216,15 @@ if __name__ == '__main__':
 
 
     
-    logging.info(f'making overall read_count frequency plot...')
+    logging.info(f'making overall read_count frequency plots (bundle)...')
     project_id = cp.get('project','project_id')        
-    make_freqplot_single_sns(df, 
-                           title='Overall read count frequency',  
-                           outfile=os.path.join(outdir, f'{project_id}.readtable-frequency-plot.pdf'),
-                           column='read_count',
-                           scale='log10' )
+    write_readtable_frequency_plots_bundle(
+        df,
+        outdir,
+        project_id,
+        column='read_count',
+        scale='log10',
+    )
     logging.info('Done.')
 
     

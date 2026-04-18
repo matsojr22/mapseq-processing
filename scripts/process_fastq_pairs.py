@@ -189,8 +189,15 @@ if __name__ == '__main__':
                                 outdir,
                                 sampdf = sampdf,                          
                                 force=args.force,
-                                cp = cp)
+                                cp = cp,
+                                reads_outfile=outfile)
     
-    write_mapseq_df(df, outfile)    
+    if df is not None:
+        write_mapseq_df(df, outfile)
+    else:
+        logging.info(
+            'fastq_low_memory: reads written incrementally to %s (no parquet sidecar here)',
+            outfile,
+        )
     logging.info('Done process_fastq_pairs')  
     
