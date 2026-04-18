@@ -1,3 +1,6 @@
+# Forked from CSHL
+This is the CSHL MAPseq core pipeline. I have forked it so that I could tailor the scripts to work on my files and machines for ongoing mapseq experiments.
+
 #	MAPseq Processing
 This protocol will guide you through the steps for turning raw sequencing reads into a viral barcode matrix, which you can then analyze yourself or in conjunction with BARseq data.
 
